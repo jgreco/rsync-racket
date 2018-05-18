@@ -1,17 +1,18 @@
 #lang racket/gui
 
+(require racket/match)
 (provide rsync-widget%)
 
 (define (read-lines-avail in)
   (define (bytes-til-last-break bstr)
     (define (is-break? x)
-      (let ([c (integer->char x)])
-        (or (eq? c #\u0a) (eq? c #\u0d)))) ; newline or carriage return
+      (define c (integer->char x))
+      (or (eq? c #\u0a) (eq? c #\u0d))) ; newline or carriage return
 
-    (let ([i (for/last ([i (in-range (sub1 (bytes-length bstr)) -1 -1)]
-                        #:final (is-break? (bytes-ref bstr i)))
-                       i)])
-      (if (is-break? (bytes-ref bstr i)) (add1 i) #f)))
+    (define i (for/last ([i (in-range (sub1 (bytes-length bstr)) -1 -1)]
+                         #:final (is-break? (bytes-ref bstr i)))
+                        i))
+    (if (is-break? (bytes-ref bstr i)) (add1 i) #f))
 
   (filter non-empty-string?
           (regexp-split #rx"[\r\n]"
@@ -28,73 +29,70 @@
                                   #""))))))))
 
 (define (start-rsync src-list dst)
-  (let* ([cmd (string-append "rsync --out-format=\"OUT: %f %l\" --size-only --progress --partial --append --files-from=- --no-R --no-D / " dst)]
-         [proc (process cmd)])
+  (define cmd (string-append "rsync --out-format=\"OUT: %f %l\" --size-only --progress --partial --append --files-from=- --no-R --no-D / " dst))
+  (match-define (list proc-stdout proc-stdin pid proc-stderr ctrl)
+    (process cmd))
 
-    (for ([l (map path->string (map path->complete-path src-list))])
-      (displayln l (second proc)))
-    (close-output-port (second proc))
+  ; feed input lines to rsync
+  ; FIXME for sufficiently long inputs, could rsync ever stop reading stdin,
+  ;       causing this to block (and potentially deadlock if rsync itself blocks on stdout)?
+  ;       
+  ;       if so, writing to rsync's stdin from a seperate thread may be worthwhile
+  (for ([l (map path->string (map path->complete-path src-list))])
+    (displayln l proc-stdin))
+  (close-output-port proc-stdin)
 
-    (list (first proc)
-          (fifth proc)
-          (λ () (eq?  ((fifth proc) 'status) 'done-ok))
-          (λ () (eq?  ((fifth proc) 'status) 'done-error))
-          (fourth proc))))
+  (list proc-stdout
+        proc-stderr
+        (λ () (or (eq?  (ctrl 'status) 'done-ok)
+                  (eq?  (ctrl 'status) 'done-error)))))
 
 (define rsync-widget%
   (class* vertical-panel% (control<%>)
           (init-field src-list dst)
           (super-new)
 
-          (define rsync-in (start-rsync src-list dst))
+          (match-define (list rsync-stdout rsync-stderr rsync-done?)
+            (start-rsync src-list dst))
 
+          ;TODO replace this with canvas% and draw something nice on it
           (define text-output (new text%))
           (define completed-list (new editor-canvas%
                                       [parent this]
-                                      [editor text-output]
-                                      ))
-          (define progress (new gauge% [label "Progress:"] [parent this] [range 1000]))
-          (define real-range 1000)
+                                      [editor text-output]))
+
+          (define progress-range 1000)
+          (define progress (new gauge% [label "Progress:"] [parent this] [range progress-range]))
+          (define file-length 1000)
 
           (define (handle-line line)
-            (let ([out (regexp-match #rx"OUT: (.*) ([0-9]+)$" line)]
-                  [progress-m (regexp-match #rx"^ +([0-9]+)" line)])
-              (if out
-                (begin
-                  (set! real-range (string->number (caddr out)))
-                  (send progress set-value 0)
-                  (send text-output insert (string-append (cadr out) "\n")))
-                (when progress-m
-                  (send progress set-value
-                        (round (* 1000 (/ (string->number (cadr progress-m))
-                                         real-range))))))))
+            (match line
+              [(regexp #rx"OUT: (.*) ([0-9]+)$" (list _ filename len))
+               (set! file-length (string->number len))
+               (send progress set-value 0)
+               (send text-output insert (string-append filename "\n"))]
+              [(regexp #rx"^ +([0-9]+)" (list _ amount-transfered))
+               (send progress set-value
+                     (round (* progress-range (/ (string->number amount-transfered)
+                                                 (max file-length 1)))))]))
+
           (define (finished)
+            (send text-output insert (string-join (read-lines-avail rsync-stderr) "\n"))
             (send timer-update stop)
             (send text-output insert "finished!"))
-          (define (print-error)
-            (define errlines (read-lines-avail (fifth rsync-in)))
-            (for ([l errlines])
-              (send text-output insert (string-append l "\n"))))
 
           (define timer-update (new timer%
-                                    [interval 1000]
+                                    [interval 100]
                                     [notify-callback
                                       (λ ()
-                                         (let ([lines (read-lines-avail (first rsync-in))]
-                                               [done-ok? ((third rsync-in))]
-                                               [done-error? ((fourth rsync-in))])
-                                           (cond
-                                             [(not (empty? lines))
-                                              (for ([line lines])
-                                                (handle-line line))]
-                                             [(and (empty? lines) done-ok?)
-                                              (finished)]
-                                             [(and (empty? lines) done-error?)
-                                              (print-error)
-                                              (finished)])))]))
+                                         (define lines (read-lines-avail rsync-stdout))
+                                         (cond
+                                           [(pair? lines)
+                                            (for ([line lines])
+                                              (handle-line line))]
+                                           [(rsync-done?) (finished)]))]))
 
-          (define/public (command e) (void))
-          ))
+          (define/public (command e) (void))))
 
 
 (module* main #f
